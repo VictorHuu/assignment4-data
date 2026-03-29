@@ -7,8 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy<2.0",
     "cs336-basics",
-    "torch~=2.7.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
-    "torch~=2.2.2; sys_platform == 'darwin' and platform_machine == 'x86_64'", # Intel Macs
+    "torch~=2.7.0",
     "tqdm>=4.67.1",
     "wandb>=0.19.7",
     "pytest>=8.3.5",
@@ -27,9 +26,24 @@ include = ["cs336_data", "tests"]
 [tool.uv]
 package = true
 python-preference = "managed"
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version >= '3.12' and python_full_version < '3.13'"]
 
 [tool.uv.sources]
 cs336-basics = { path = "./cs336-basics", editable = true }
+torch = { index = "local-wheels" }
+triton = { index = "local-wheels" }
+nvidia-cublas-cu12 = { index = "local-wheels" }
+nvidia-cudnn-cu12 = { index = "local-wheels" }
+nvidia-cufft-cu12 = { index = "local-wheels" }
+nvidia-curand-cu12 = { index = "local-wheels" }
+nvidia-cusolver-cu12 = { index = "local-wheels" }
+nvidia-cusparse-cu12 = { index = "local-wheels" }
+nvidia-cusparselt-cu12 = { index = "local-wheels" }
+nvidia-nccl-cu12 = { index = "local-wheels" }
+nvidia-nvjitlink-cu12 = { index = "local-wheels" }
+nvidia-cuda-nvrtc-cu12 = { index = "local-wheels" }
+numpy = {index="local-wheels"}
+wandb = { index = "local-wheels" }
 
 [tool.pytest.ini_options]
 log_cli = true
@@ -48,3 +62,10 @@ extend-select = ["UP"]
 ignore = [
     "F722"
 ]
+
+[[tool.uv.index]]
+name = "local-wheels"
+url = "file:///root/autodl-tmp/assignment4-data/wheels"
+format = "flat"
+explicit = true
+
