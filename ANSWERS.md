@@ -73,3 +73,20 @@ You should strip all the ```Enter``` with whitespace since models like fastText 
 
 - It also made false negatives on some informative pages, including **a substantive FAQ-style accessibility page and a noisy but still useful news page**, showing that simple heuristics can miss semantically valuable text while allowing some boilerplate-heavy pages through.
 
+## 2.7 Quality Classifier
+The quality classifier is available at [hf-repo](https://huggingface.co/rahulrao493/cs336-data-collection)
+
+Collect inputs: one positive WARC (Wikipedia-linked pages) and one negative WARC (Common Crawl pages). The pipeline has defaults for both. 
+
+Extract + clean text from WARC responses:
+
+- positives use stricter filtering (length, English ID, Gopher quality),
+
+- negatives use lighter filtering (length + optional English, no Gopher) to preserve low-quality signals. 
+
+- Build supervised training file (quality_train.txt) in fastText format with ```__label__hq``` and ```__label__lq```. 
+
+- Balance classes by truncating to the smaller side, then train fastText and save ```quality_classifier.bin```. 
+
+- Run inference with optional threshold control (infer --threshold ...) or call runtime ```classify_quality``` from the helper module.
+

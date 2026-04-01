@@ -17,6 +17,9 @@ from cs336_data.filtering_helper import (
 )
 
 DEFAULT_MODEL_PATH = "quality_classifier.bin"
+DEFAULT_POSITIVE_WARC = "subsampled_positive_urls.warc.gz"
+DEFAULT_NEGATIVE_WARC = "CC-MAIN-20250417135010-20250417165010-00065.warc.gz"
+DEFAULT_TRAIN_FILE = "quality_train.txt"
 
 
 def _open_maybe_gzip(path: Path):
@@ -29,7 +32,7 @@ def normalize_text(text: str) -> str:
     return " ".join(text.split())
 
 
-def keep_training_text(text: str, min_chars: int = 200) -> bool:
+def keep_positive_training_text(text: str, min_chars: int = 200) -> bool:
     """
     Apply light filtering before using a page as a training example.
     """
@@ -54,10 +57,39 @@ def keep_training_text(text: str, min_chars: int = 200) -> bool:
     return True
 
 
+def keep_negative_training_text(
+    text: str,
+    min_chars: int = 50,
+    require_english: bool = True,
+) -> bool:
+    """
+    Keep *representative* negatives:
+    - apply only light normalization/length checks,
+    - optionally keep to English to avoid the classifier learning language
+      instead of quality,
+    - do NOT run Gopher quality filter (otherwise we erase low-quality signal).
+    """
+    text = normalize_text(text)
+    if len(text) < min_chars:
+        return False
+
+    if not require_english:
+        return True
+
+    try:
+        lang, score = identify_language(text)
+    except Exception:
+        return False
+
+    return lang == "en" and score >= 0.5
+
+
 def read_warc_texts(
     warc_paths: list[Path],
     max_docs: int | None = None,
     min_chars: int = 200,
+    label_type: str = "positive",
+    require_english_for_negative: bool = True,
 ) -> list[str]:
     """
     Extract English, reasonably clean texts from WARC files.
@@ -80,7 +112,18 @@ def read_warc_texts(
                     continue
 
                 text = normalize_text(text)
-                if keep_training_text(text, min_chars=min_chars):
+                if label_type == "positive":
+                    keep = keep_positive_training_text(text, min_chars=min_chars)
+                elif label_type == "negative":
+                    keep = keep_negative_training_text(
+                        text,
+                        min_chars=min_chars,
+                        require_english=require_english_for_negative,
+                    )
+                else:
+                    raise ValueError("label_type must be one of: positive, negative")
+
+                if keep:
                     docs.append(text)
 
                 if max_docs is not None and len(docs) >= max_docs:
@@ -129,6 +172,52 @@ def train_quality_model(
     model.save_model(str(model_out))
 
 
+def train_from_warcs(
+    positive_warcs: list[Path],
+    negative_warcs: list[Path],
+    train_out: Path = Path(DEFAULT_TRAIN_FILE),
+    model_out: Path = Path(DEFAULT_MODEL_PATH),
+    max_positive: int = 50000,
+    max_negative: int = 50000,
+    min_positive_chars: int = 200,
+    min_negative_chars: int = 50,
+    require_english_for_negative: bool = True,
+) -> tuple[int, int]:
+    """
+    End-to-end pipeline:
+      1) read/clean positive + negative WARC docs
+      2) write fastText training file
+      3) train and save classifier model
+    Returns (num_positive_docs, num_negative_docs).
+    """
+    positive_docs = read_warc_texts(
+        positive_warcs,
+        max_docs=max_positive,
+        min_chars=min_positive_chars,
+        label_type="positive",
+    )
+    negative_docs = read_warc_texts(
+        negative_warcs,
+        max_docs=max_negative,
+        min_chars=min_negative_chars,
+        label_type="negative",
+        require_english_for_negative=require_english_for_negative,
+    )
+    n = min(len(positive_docs), len(negative_docs))
+    positive_docs = positive_docs[:n]
+    negative_docs = negative_docs[:n]
+    write_fasttext_training_file(
+        positive_docs=positive_docs,
+        negative_docs=negative_docs,
+        out_path=train_out,
+    )
+    train_quality_model(
+        train_file=train_out,
+        model_out=model_out,
+    )
+    return len(positive_docs), len(negative_docs)
+
+
 def _load_quality_model(model_path: str | Path = DEFAULT_MODEL_PATH):
     return fasttext.load_model(str(model_path))
 
@@ -136,6 +225,7 @@ def _load_quality_model(model_path: str | Path = DEFAULT_MODEL_PATH):
 def classify_quality(
     text: str,
     model_path: str | Path = DEFAULT_MODEL_PATH,
+    threshold: float = 0.5,
 ) -> tuple[Any, float]:
     """
     Return:
@@ -146,7 +236,7 @@ def classify_quality(
         return "low_quality", 1.0
 
     model = _load_quality_model(model_path)
-    labels, probs = model.predict(text.replace("\n", " "), k=1)
+    labels, probs = model.predict(text.replace("\n", " "), k=2)
 
     label = labels[0]
     score = float(probs[0])
@@ -163,7 +253,12 @@ def classify_quality(
         "0": "low_quality",
     }
 
-    return mapping.get(label, label), score
+    normalized_label = mapping.get(label, label)
+    if normalized_label == "high_quality" and score < threshold:
+        return "low_quality", 1.0 - score
+    if normalized_label == "low_quality" and (1.0 - score) < threshold:
+        return "high_quality", 1.0 - score
+    return normalized_label, score
 
 
 def run_classify_quality(text: str) -> tuple[Any, float]:
@@ -184,16 +279,46 @@ def parse_args():
     prep.add_argument("--negative_warcs", nargs="+", required=True)
     prep.add_argument("--max_positive", type=int, default=50000)
     prep.add_argument("--max_negative", type=int, default=50000)
-    prep.add_argument("--min_chars", type=int, default=200)
-    prep.add_argument("--output", default="quality_train.txt")
+    prep.add_argument("--min_positive_chars", type=int, default=200)
+    prep.add_argument("--min_negative_chars", type=int, default=50)
+    prep.add_argument(
+        "--no_require_english_for_negative",
+        action="store_true",
+        help="Keep negative examples even when language ID is not English.",
+    )
+    prep.add_argument("--output", default=DEFAULT_TRAIN_FILE)
 
     train = subparsers.add_parser("train")
     train.add_argument("--train_file", required=True)
     train.add_argument("--model_out", default=DEFAULT_MODEL_PATH)
 
+    end2end = subparsers.add_parser("train_from_warcs")
+    end2end.add_argument(
+        "--positive_warcs",
+        nargs="+",
+        default=[DEFAULT_POSITIVE_WARC],
+    )
+    end2end.add_argument(
+        "--negative_warcs",
+        nargs="+",
+        default=[DEFAULT_NEGATIVE_WARC],
+    )
+    end2end.add_argument("--max_positive", type=int, default=50000)
+    end2end.add_argument("--max_negative", type=int, default=50000)
+    end2end.add_argument("--min_positive_chars", type=int, default=200)
+    end2end.add_argument("--min_negative_chars", type=int, default=50)
+    end2end.add_argument(
+        "--no_require_english_for_negative",
+        action="store_true",
+        help="Keep negative examples even when language ID is not English.",
+    )
+    end2end.add_argument("--train_out", default=DEFAULT_TRAIN_FILE)
+    end2end.add_argument("--model_out", default=DEFAULT_MODEL_PATH)
+
     infer = subparsers.add_parser("infer")
     infer.add_argument("--text", required=True)
     infer.add_argument("--model_path", default=DEFAULT_MODEL_PATH)
+    infer.add_argument("--threshold", type=float, default=0.5)
 
     return parser.parse_args()
 
@@ -205,12 +330,15 @@ def main():
         positive_docs = read_warc_texts(
             [Path(p) for p in args.positive_warcs],
             max_docs=args.max_positive,
-            min_chars=args.min_chars,
+            min_chars=args.min_positive_chars,
+            label_type="positive",
         )
         negative_docs = read_warc_texts(
             [Path(p) for p in args.negative_warcs],
             max_docs=args.max_negative,
-            min_chars=args.min_chars,
+            min_chars=args.min_negative_chars,
+            label_type="negative",
+            require_english_for_negative=not args.no_require_english_for_negative,
         )
 
         write_fasttext_training_file(
@@ -230,8 +358,29 @@ def main():
         )
         print(f"saved model to: {args.model_out}")
 
+    elif args.command == "train_from_warcs":
+        pos_count, neg_count = train_from_warcs(
+            positive_warcs=[Path(p) for p in args.positive_warcs],
+            negative_warcs=[Path(p) for p in args.negative_warcs],
+            train_out=Path(args.train_out),
+            model_out=Path(args.model_out),
+            max_positive=args.max_positive,
+            max_negative=args.max_negative,
+            min_positive_chars=args.min_positive_chars,
+            min_negative_chars=args.min_negative_chars,
+            require_english_for_negative=not args.no_require_english_for_negative,
+        )
+        print(f"positives kept: {pos_count}")
+        print(f"negatives kept: {neg_count}")
+        print(f"wrote training file to: {args.train_out}")
+        print(f"saved model to: {args.model_out}")
+
     elif args.command == "infer":
-        label, score = classify_quality(args.text, model_path=args.model_path)
+        label, score = classify_quality(
+            args.text,
+            model_path=args.model_path,
+            threshold=args.threshold,
+        )
         print(label, score)
 
 

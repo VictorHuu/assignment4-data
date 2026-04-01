@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from typing import Any
 
 from fastwarc.warc import ArchiveIterator, WarcRecordType
@@ -155,6 +156,63 @@ def classify_toxic_speech(text: str) -> tuple[Any, float]:
 
 WORD_RE = re.compile(r"\b\S+\b")
 ALPHA_RE = re.compile(r"[A-Za-z]")
+_QUALITY_MODEL = None
+
+
+def _load_quality_model_if_available():
+    global _QUALITY_MODEL
+    if _QUALITY_MODEL is not None:
+        return _QUALITY_MODEL
+    if os.path.exists("quality_classifier.bin"):
+        _QUALITY_MODEL = fasttext.load_model("quality_classifier.bin")
+    return _QUALITY_MODEL
+
+
+def _train_quality_model_if_possible(
+    train_file: str = "quality_train.txt", model_file: str = "quality_classifier.bin"
+):
+    if not os.path.exists(train_file):
+        return None
+    model = fasttext.train_supervised(
+        input=train_file,
+        lr=0.5,
+        epoch=25,
+        wordNgrams=2,
+        minn=2,
+        maxn=5,
+        dim=100,
+        loss="softmax",
+        thread=8,
+    )
+    model.save_model(model_file)
+    return model
+
+
+def classify_quality(text: str) -> tuple[Any, float]:
+    normalized = " ".join(text.split())
+    if not normalized:
+        return "cc", 1.0
+
+    model = _load_quality_model_if_available()
+    if model is None:
+        model = _train_quality_model_if_possible()
+    if model is None:
+        raise FileNotFoundError(
+            "quality classifier not found. "
+            "Please train one first. Example: "
+            "python -m cs336_data.quality_classifier train_from_warcs "
+            "--positive_warcs subsampled_positive_urls.warc.gz "
+            "--negative_warcs CC-MAIN-20250417135010-20250417165010-00065.warc.gz"
+        )
+
+    labels, probs = model.predict(normalized, k=1)
+    label = labels[0].replace("__label__", "").lower()
+    score = float(probs[0])
+    if label in {"wiki", "hq", "high_quality", "1"}:
+        return "wiki", score
+    if label in {"cc", "lq", "low_quality", "0"}:
+        return "cc", score
+    return label, score
 
 def gopher_quality_filter(text: str) -> bool:
     words = WORD_RE.findall(text)
